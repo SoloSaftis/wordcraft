@@ -1,6 +1,6 @@
 use super::{
     Exporter, FaceRef, Fill, FillRule, KrillaGlyph, Point, Rgb, Stroke, Surface, Transform, baseline, cluster_ends, fill, glyph_id, glyph_outlines,
-    left_to_right, norm, ok, paint_of, rgb, split_clusters, visual_order,
+    bare_marks, left_to_right, norm, ok, paint_of, rgb, split_clusters, visual_order, word_ranges,
 };
 
 /// How a run of glyphs is painted: its colour, opacity and synthetic bold and italic.
@@ -114,24 +114,44 @@ impl Exporter<'_> {
         // out with the vowel sign first («इंजीिनयर»). Kept in logical order, each cluster keeps
         // its whole text and reads right (krilla writes it as one ActualText span).
         let rtl_text = ranges.iter().any(|r| txt.get(r.clone()).is_some_and(|t| t.chars().any(wordcraft_fonts::is_rtl)));
-        let (order, ranges) = if left_to_right(glyphs) || !rtl_text {
+        let is_mark = |g: u32| face.advance(g) == 0.0;
+        let (order, ranges) = if !rtl_text {
+            ((0..glyphs.len()).collect(), word_ranges(&txt, &ranges, glyphs, is_mark))
+        } else if left_to_right(glyphs) {
             ((0..glyphs.len()).collect(), ranges)
         } else {
+            // Not as word spans like left-to-right text: PDF readers (xpdf, poppler) take a
+            // right-to-left span's text as if in visual order and reverse it («ًاقيرف»).
             let parts = split_clusters(&txt, glyphs, &ranges, &self.cmap(face));
-            (visual_order(&txt, glyphs, &ranges, &parts), parts)
+            let order = visual_order(&txt, glyphs, &ranges, &parts);
+            (order, bare_marks(&parts, glyphs, is_mark))
         };
         let placed: Vec<(u32, f32, f32, std::ops::Range<usize>)> =
             order.iter().filter_map(|&i| Some((glyphs.get(i).copied()?, ranges.get(i).cloned()?))).map(|((g, x, y), r)| (g, x, y, r)).collect();
+        // Each glyph advances the pen to the next glyph that takes room. A mark (a glyph with no
+        // advance of its own: a vowel sign over its consonant, a dot, a harakat) is placed with an
+        // offset from the pen and leaves it where it is. Pulling the pen back for a mark, as the
+        // next glyph's position would, makes a cluster («के») end short of where the next one starts,
+        // and text extractors read that gap as a space («एप्लिके शन»).
+        let mark = |g: u32| face.advance(g) == 0.0;
         let Some(&(_, x0, y0, _)) = placed.first() else { return };
+        let mut pen = x0;
         let kg: Vec<KrillaGlyph> = placed
             .iter()
             .enumerate()
             .map(|(k, (g, x, y, r))| {
-                let adv = match placed.get(k + 1) {
-                    Some((_, nx, _, _)) => (nx - x) / size,
+                let y_off = (y0 - y) / size;
+                if mark(*g) {
+                    return KrillaGlyph::new(glyph_id(*g), 0.0, (x - pen) / size, y_off, 0.0, r.clone(), None);
+                }
+                let next = placed.get(k + 1..).and_then(|rest| rest.iter().find(|(ng, ..)| !mark(*ng)));
+                let x_off = (x - pen) / size;
+                let adv = match next {
+                    Some((_, nx, _, _)) => (nx - pen) / size - x_off,
                     None => face.advance(*g) as f32 / upem,
                 };
-                KrillaGlyph::new(glyph_id(*g), adv, 0.0, (y0 - y) / size, 0.0, r.clone(), None)
+                pen += (adv + x_off) * size;
+                KrillaGlyph::new(glyph_id(*g), adv, x_off, y_off, 0.0, r.clone(), None)
             })
             .collect();
         let pushed = italic;

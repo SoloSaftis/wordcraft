@@ -1,5 +1,5 @@
 use super::export::Fit;
-use super::glyphs::{baseline, cluster_ends, glyph_id, glyph_outlines, left_to_right, split_clusters, visual_order};
+use super::glyphs::{bare_marks, baseline, cluster_ends, glyph_id, glyph_outlines, left_to_right, split_clusters, visual_order, word_ranges};
 use super::options::{PdfError, PdfOptions};
 use super::paint::{append_path, fill, grown, norm, ok, paint_fill, pdf_line_cap, rect_path, shape_effects, shape_path};
 use super::picture::{Vector, build_vector, load_image, paint_of, vector_picture};
