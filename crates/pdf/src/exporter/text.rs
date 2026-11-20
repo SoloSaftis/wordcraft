@@ -3,6 +3,30 @@ use super::{
     bare_marks, left_to_right, norm, ok, paint_of, rgb, split_clusters, visual_order, word_ranges,
 };
 
+/// In right-to-left text in visual order, a cluster's marks (no advance: dots, harakat) come
+/// before the letter they sit on. Written that way, a run that starts with a mark starts its text
+/// inside the letter, and readers split the word there («الشخصي ة»). Each mark moves to just
+/// after its letter: the letter that follows it and whose text starts at or before the mark's.
+/// Marks with text of their own (harakat kept with their letter) stay where they are: Chrome-like
+/// viewers read them in that order.
+fn marks_after_base(placed: &mut [(u32, f32, f32, std::ops::Range<usize>)], is_mark: impl Fn(u32) -> bool) {
+    let mut k = 0;
+    while k < placed.len() {
+        let start = k;
+        while k < placed.len() && placed.get(k).is_some_and(|p| is_mark(p.0)) {
+            k += 1;
+        }
+        let Some(base) = placed.get(k) else { break };
+        let owns = |m: &(u32, f32, f32, std::ops::Range<usize>)| base.3.start <= m.3.start && m.3.is_empty();
+        if k > start && placed.get(start..k).is_some_and(|marks| marks.iter().all(owns)) {
+            if let Some(cluster) = placed.get_mut(start..=k) {
+                cluster.rotate_right(1);
+            }
+        }
+        k += 1;
+    }
+}
+
 /// How a run of glyphs is painted: its colour, opacity and synthetic bold and italic.
 #[derive(Clone, Copy)]
 pub(super) struct GlyphPaint {
@@ -126,8 +150,11 @@ impl Exporter<'_> {
             let order = visual_order(&txt, glyphs, &ranges, &parts);
             (order, bare_marks(&parts, glyphs, is_mark))
         };
-        let placed: Vec<(u32, f32, f32, std::ops::Range<usize>)> =
+        let mut placed: Vec<(u32, f32, f32, std::ops::Range<usize>)> =
             order.iter().filter_map(|&i| Some((glyphs.get(i).copied()?, ranges.get(i).cloned()?))).map(|((g, x, y), r)| (g, x, y, r)).collect();
+        if rtl_text && !left_to_right(glyphs) {
+            marks_after_base(&mut placed, |g| face.advance(g) == 0.0);
+        }
         // Each glyph advances the pen to the next glyph that takes room. A mark (a glyph with no
         // advance of its own: a vowel sign over its consonant, a dot, a harakat) is placed with an
         // offset from the pen and leaves it where it is. Pulling the pen back for a mark, as the
