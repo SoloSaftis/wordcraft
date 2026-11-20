@@ -1,6 +1,6 @@
 use super::{
-    Exporter, FaceRef, Fill, FillRule, KrillaGlyph, Point, Rgb, Stroke, Surface, Transform, baseline, cluster_ends, fill, glyph_id, glyph_outlines,
-    bare_marks, left_to_right, norm, ok, paint_of, rgb, split_clusters, visual_order, word_ranges,
+    Exporter, FaceRef, Fill, FillRule, KrillaGlyph, Point, Rgb, Stroke, Surface, Transform, bare_marks, baseline, cluster_ends, fill, glyph_id,
+    glyph_outlines, left_to_right, norm, ok, paint_of, precompose, rgb, split_clusters, visual_order, word_ranges,
 };
 
 /// In right-to-left text in visual order, a cluster's marks (no advance: dots, harakat) come
@@ -104,6 +104,30 @@ impl Exporter<'_> {
         (text.to_string(), ranges)
     }
 
+    /// A letter the font drew as a base glyph and zero-width marks (Cambria and Calibri decompose
+    /// «å» into «a» and a ring) is written as the font's own precomposed glyph for that letter,
+    /// when it has one. Otherwise the base glyph, already mapped to «a» in the PDF's ToUnicode
+    /// table, can only carry «å» as ActualText, which many text extractors (and applicant
+    /// tracking systems) ignore: «nå» reads «na». Scripts that need their shaped clusters
+    /// (Devanagari, Thai, Arabic …) are left as they are. `None` when nothing changes.
+    fn precomposed(
+        &mut self,
+        face: &FaceRef,
+        glyphs: &[(u32, f32, f32)],
+        txt: &str,
+        ranges: &[std::ops::Range<usize>],
+    ) -> Option<(Vec<(u32, f32, f32)>, Vec<std::ops::Range<usize>>)> {
+        let is_mark = |g: u32| face.advance(g) == 0.0;
+        // Only runs with a cluster of a glyph and marks are worth building the lookup for.
+        if !ranges.windows(2).zip(glyphs.windows(2)).any(|(r, g)| r[0] == r[1] && is_mark(g[1].0)) {
+            return None;
+        }
+        let cmap = self.cmap(face);
+        // The lowest glyph id for the character, so the choice doesn't depend on map order.
+        let glyph_of = |c: char| cmap.iter().filter(|&(_, &v)| v == c).map(|(&g, _)| g).min();
+        precompose(glyphs, txt, ranges, is_mark, glyph_of)
+    }
+
     pub(super) fn glyphs(
         &mut self,
         s: &mut Surface,
@@ -132,6 +156,11 @@ impl Exporter<'_> {
         // ligatures can't be guessed back from the font's cmap), else a guess.
         let valid = known.len() == glyphs.len() && known.iter().all(|r| r.start < r.end && text.get(r.clone()).is_some());
         let (txt, ranges) = if valid { (text.to_string(), known.to_vec()) } else { self.map_text(face, glyphs, text) };
+        let composed = self.precomposed(face, glyphs, &txt, &ranges);
+        let (glyphs, ranges): (&[(u32, f32, f32)], Vec<std::ops::Range<usize>>) = match &composed {
+            Some((g, r)) => (g, r.clone()),
+            None => (glyphs, ranges),
+        };
         let upem = face.upem.max(1.0) as f32;
         // Right-to-left text is written left to right as it appears (see `left_to_right`); glyphs
         // already in that order are written as they are. So is left-to-right text whose glyphs

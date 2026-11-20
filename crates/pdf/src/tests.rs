@@ -2912,3 +2912,44 @@ fn the_author_is_left_out_when_personal_information_is_removed() {
     d.settings.remove_personal_info = true;
     assert!(!raw(&d).contains("Ada Writer"), "the creator stays out of the PDF");
 }
+
+/// Cambria and Calibri draw «å» as «a» (glyph 10) and a zero-width ring (glyph 90), both with
+/// the text «å». Written like that, the «a» glyph's ToUnicode entry is «a» and «å» survives only
+/// as ActualText, which many extractors ignore («nå» → «na»). The font's own «å» (glyph 20) is
+/// written instead, at the «a»'s position. A cluster of a letter with marks whose font has no
+/// such glyph, and a Devanagari cluster, stay as they are.
+#[test]
+fn letter_and_marks_become_the_fonts_precomposed_glyph() {
+    let is_mark = |g: u32| g >= 90;
+    let fonts_own = |c: char| (c == 'å').then_some(20);
+    // «nå»: n, a + ring.
+    let glyphs = [(5, 0.0, 10.0), (10, 6.0, 10.0), (90, 6.5, 10.0)];
+    let ranges = [0..1, 1..3, 1..3];
+    let (g, r) = precompose(&glyphs, "nå", &ranges, is_mark, fonts_own).expect("composed");
+    assert_eq!(g, [(5, 0.0, 10.0), (20, 6.0, 10.0)]);
+    assert_eq!(r, [0..1, 1..3]);
+    // No precomposed glyph in the font: unchanged.
+    assert_eq!(precompose(&glyphs, "nå", &ranges, is_mark, |_| None), None);
+    // Nothing decomposed: unchanged.
+    assert_eq!(precompose(&[(5, 0.0, 10.0), (20, 6.0, 10.0)], "nå", &[0..1, 1..3], is_mark, fonts_own), None);
+    // Devanagari «कि» (ka + vowel sign i) is one cluster of two glyphs: left for the shaper's order.
+    let ki = "कि";
+    assert_eq!(precompose(&[(30, 0.0, 10.0), (91, 0.0, 10.0)], ki, &[0..ki.len(), 0..ki.len()], is_mark, |_| Some(40)), None);
+}
+
+/// A Latin word with a mark glyph («å» as «a» and a ring) keeps its per-glyph text: only words
+/// of scripts that need shaping share one ActualText span. Giving the «a» glyph the whole word
+/// put that word in the font's ToUnicode map for every later «a» («Automasjonsingeniør»).
+#[test]
+fn latin_words_with_marks_keep_their_per_glyph_text() {
+    let is_mark = |g: u32| g >= 90;
+    let text = "7 års";
+    let glyphs = [(1, 0.0, 0.0), (2, 5.0, 0.0), (10, 8.0, 0.0), (90, 8.5, 0.0), (11, 14.0, 0.0), (12, 18.0, 0.0)];
+    let ranges = [0..1, 1..2, 2..4, 2..4, 4..5, 5..6];
+    assert_eq!(word_ranges(text, &ranges, &glyphs, is_mark), ranges);
+    // A Devanagari word still becomes one span.
+    let hi = "के ";
+    let glyphs = [(30, 0.0, 0.0), (91, 0.0, 0.0), (2, 8.0, 0.0)];
+    let ranges = [0..6, 0..6, 6..7];
+    assert_eq!(word_ranges(hi, &ranges, &glyphs, is_mark), [0..6, 0..6, 6..7]);
+}

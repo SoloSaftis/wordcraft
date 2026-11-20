@@ -158,7 +158,10 @@ pub(crate) fn cluster_ends(clusters: &[usize], len: usize) -> Vec<usize> {
 /// writes the word as one ActualText span. Text extractors place a cluster's text by its glyphs,
 /// and a cluster ending in a mark drawn back over its consonant («के») looks to them like it ends
 /// early: they read the gap to the next cluster as a space («एप्लिके शन»). As one span the word
-/// reads whole. Runs without such clusters keep their ranges (and their per-glyph text).
+/// reads whole. Runs without such clusters keep their ranges (and their per-glyph text), and so
+/// do words with no character of such a script: a Latin «å» drawn as «a» plus a ring mark (as
+/// Calibri and Cambria do) must not give the «a» glyph the whole word as its text, or krilla's
+/// ToUnicode map sends every later «a» to that word.
 pub(crate) fn word_ranges(
     text: &str,
     ranges: &[std::ops::Range<usize>],
@@ -188,7 +191,8 @@ pub(crate) fn word_ranges(
         }
         out
     };
-    let word_of = |r: &std::ops::Range<usize>| words.iter().find(|w| w.start <= r.start && r.end <= w.end).cloned();
+    let complex = |w: &std::ops::Range<usize>| text.get(w.clone()).is_some_and(|t| t.chars().any(wordcraft_fonts::needs_layout_tables));
+    let word_of = |r: &std::ops::Range<usize>| words.iter().find(|w| w.start <= r.start && r.end <= w.end && complex(w)).cloned();
     let mut out: Vec<std::ops::Range<usize>> = ranges.iter().map(|r| word_of(r).unwrap_or_else(|| r.clone())).collect();
     // A word's glyphs must follow each other to share a span; when they don't (a word broken by
     // something placed in between), keep the original ranges.
@@ -201,6 +205,50 @@ pub(crate) fn word_ranges(
     }
     out.shrink_to_fit();
     out
+}
+
+/// Clusters of one letter drawn as a base glyph and zero-width marks (Cambria and Calibri draw
+/// «å» as «a» plus a ring) become the font's own glyph for that letter, at the base glyph's
+/// position, when the font has one (`glyph_of`). The base glyph's ToUnicode entry is the plain
+/// letter, so the cluster's «å» could only go in ActualText, which many extractors and applicant
+/// tracking systems ignore («nå» read as «na»). Letters of scripts that need shaping
+/// (`needs_layout_tables`) keep their clusters. `None` when nothing changes.
+pub(crate) fn precompose(
+    glyphs: &[(u32, f32, f32)],
+    text: &str,
+    ranges: &[std::ops::Range<usize>],
+    is_mark: impl Fn(u32) -> bool,
+    glyph_of: impl Fn(char) -> Option<u32>,
+) -> Option<(Vec<(u32, f32, f32)>, Vec<std::ops::Range<usize>>)> {
+    let mut out_g = Vec::with_capacity(glyphs.len());
+    let mut out_r = Vec::with_capacity(ranges.len());
+    let mut changed = false;
+    let mut i = 0;
+    while let (Some(&g), Some(r)) = (glyphs.get(i), ranges.get(i)) {
+        // The cluster: this glyph and the marks after it with the same text.
+        let mut j = i + 1;
+        while glyphs.get(j).is_some_and(|m| is_mark(m.0)) && ranges.get(j) == Some(r) {
+            j += 1;
+        }
+        let mut chars = text.get(r.clone()).unwrap_or("").chars();
+        let letter = match (chars.next(), chars.next()) {
+            (Some(c), None) if j > i + 1 && !is_mark(g.0) && !wordcraft_fonts::needs_layout_tables(c) => Some(c),
+            _ => None,
+        };
+        match letter.and_then(&glyph_of).filter(|&pre| !is_mark(pre)) {
+            Some(pre) => {
+                out_g.push((pre, g.1, g.2));
+                out_r.push(r.clone());
+                changed = true;
+            }
+            None => {
+                out_g.extend_from_slice(glyphs.get(i..j).unwrap_or_default());
+                out_r.extend_from_slice(ranges.get(i..j).unwrap_or_default());
+            }
+        }
+        i = j;
+    }
+    (changed && out_r.len() == out_g.len()).then_some((out_g, out_r))
 }
 
 /// Right-to-left clusters drawn as one glyph that takes room plus marks of no text of their own
