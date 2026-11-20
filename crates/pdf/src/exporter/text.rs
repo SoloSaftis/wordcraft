@@ -17,7 +17,9 @@ fn marks_after_base(placed: &mut [(u32, f32, f32, std::ops::Range<usize>)], is_m
             k += 1;
         }
         let Some(base) = placed.get(k) else { break };
-        let owns = |m: &(u32, f32, f32, std::ops::Range<usize>)| base.3.start <= m.3.start && m.3.is_empty();
+        // At the start of the run every mark moves: the run must start at a letter, or readers
+        // draw the run shifted (the space before the word is lost, «اللغا ت»).
+        let owns = |m: &(u32, f32, f32, std::ops::Range<usize>)| base.3.start <= m.3.start && (m.3.is_empty() || start == 0);
         if k > start && placed.get(start..k).is_some_and(|marks| marks.iter().all(owns)) {
             if let Some(cluster) = placed.get_mut(start..=k) {
                 cluster.rotate_right(1);
