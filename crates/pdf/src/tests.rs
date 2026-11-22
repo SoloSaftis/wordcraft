@@ -2953,3 +2953,81 @@ fn latin_words_with_marks_keep_their_per_glyph_text() {
     let ranges = [0..6, 0..6, 6..7];
     assert_eq!(word_ranges(hi, &ranges, &glyphs, is_mark), [0..6, 0..6, 6..7]);
 }
+
+/// The uncompressed PDF of `d` without whitespace, for looking for dictionary entries.
+fn raw_squashed(d: &Document, opts: PdfOptions) -> String {
+    let bytes = export(d, &PdfOptions { compress: false, ..opts }).unwrap();
+    String::from_utf8_lossy(&bytes).split_whitespace().collect()
+}
+
+/// How many `L` structure elements (not `LI`, `Lbl` or `LBody`) the squashed PDF has.
+fn lists_in(raw: &str) -> usize {
+    raw.match_indices("/S/L").filter(|(i, m)| !raw[i + m.len()..].starts_with(|c: char| c.is_ascii_alphanumeric())).count()
+}
+
+/// List paragraphs are `L` > `LI` > `LBody` with the list's label kind, headings `Hn`, and the
+/// document language is on the catalog and the structure tree.
+#[test]
+fn lists_and_headings_are_tagged_with_the_language() {
+    let mut d = sample();
+    Arc::make_mut(&mut d.styles).default_chr.lang = Some("nb-NO".into());
+    let raw = raw_squashed(&d, PdfOptions::default());
+    assert!(raw.contains("/Lang(nb-NO)"), "document language");
+    assert!(raw.contains("/S/H1") && raw.contains("/S/H2"), "headings");
+    assert_eq!(lists_in(&raw), 1, "one list");
+    assert_eq!(raw.matches("/S/LI").count(), 2, "an item per paragraph");
+    assert_eq!(raw.matches("/S/LBody").count(), 2);
+    assert!(raw.contains("/ListNumbering/Decimal"), "numbered list");
+    assert!(raw.contains("/Alt(gradient)"), "picture alt text");
+}
+
+/// A deeper level is a list inside the item before it; another list starts a new `L`.
+#[test]
+fn nested_and_separate_lists() {
+    let mut d = Document::new();
+    d.core.title = "Lists".into();
+    let numbering = Arc::make_mut(&mut d.numbering);
+    let (bullets, numbers) = (numbering.add_list(ListKind::Bullet), numbering.add_list(ListKind::Numbered));
+    let item = |t: &str, num: u32, level: u8| {
+        let mut q = Paragraph::with_text(t, CharProps::default()).styled("ListParagraph");
+        q.props.numbering = Some(NumRef { num, level });
+        para_block(q)
+    };
+    d.body = vec![
+        item("one", bullets, 0),
+        item("one a", bullets, 1),
+        item("one b", bullets, 1),
+        item("two", bullets, 0),
+        para_block(Paragraph::with_text("between", CharProps::default())),
+        item("first", numbers, 0),
+    ];
+    let raw = raw_squashed(&d, PdfOptions::default());
+    assert_eq!(lists_in(&raw), 3, "outer bullets, the nested level, the numbered list");
+    assert_eq!(raw.matches("/S/LI").count(), 5);
+    assert!(raw.contains("/ListNumbering/Disc") && raw.contains("/ListNumbering/Decimal"));
+}
+
+/// A plain document with a title, a language and headings passes krilla's PDF/UA-1 checks and
+/// is then written as PDF/UA-1; without a title it is not, and says why.
+#[test]
+fn pdf_ua_when_the_checks_pass() {
+    let mut d = Document::new();
+    d.core.title = "Ada Writer – CV".into();
+    Arc::make_mut(&mut d.styles).default_chr.lang = Some("en".into());
+    d.body = vec![
+        para_block(Paragraph::with_text("Experience", CharProps::default()).styled("Heading1")),
+        para_block(Paragraph::with_text("Wrote the first program.", CharProps::default())),
+    ];
+    assert_eq!(pdf_ua_problems(&d, &PdfOptions::default()).unwrap(), Vec::<String>::new());
+    let ua = raw_squashed(&d, PdfOptions { pdf_ua: true, ..Default::default() });
+    assert!(ua.contains("pdfuaid:part"), "PDF/UA identifier");
+    assert!(ua.contains("/DisplayDocTitletrue"), "title in the title bar");
+    let plain = raw_squashed(&d, PdfOptions::default());
+    assert!(!plain.contains("pdfuaid"), "no claim without the option");
+
+    d.core.title.clear();
+    let problems = pdf_ua_problems(&d, &PdfOptions::default()).unwrap();
+    assert!(problems.iter().any(|p| p.starts_with("NoDocumentTitle")), "{problems:?}");
+    let fallback = raw_squashed(&d, PdfOptions { pdf_ua: true, ..Default::default() });
+    assert!(!fallback.contains("pdfuaid"), "a file that fails is written without the claim");
+}

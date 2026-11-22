@@ -5,7 +5,7 @@ use super::glyphs::{
 use super::options::{PdfError, PdfOptions};
 use super::paint::{append_path, fill, grown, norm, ok, paint_fill, pdf_line_cap, rect_path, shape_effects, shape_path};
 use super::picture::{Vector, build_vector, load_image, paint_of, vector_picture};
-use super::tags::{Role, TagEntry, figure_alt, graphic_alt, holds_picture, holds_text};
+use super::tags::{ListItem, Role, TagEntry, figure_alt, graphic_alt, holds_picture, holds_text, list_numbering, structure};
 use super::{
     Annotation, Arc, Artifact, ArtifactType, ClKind, ContentTag, DisplayOptions, DocLayout, DocPath, Document, Draw, FaceRef, Fill, FillRule, Font,
     HashMap, HashSet, Identifier, Image, InlineObject, ItemDisplay, KrillaGlyph, LineCap, LineEnd, LineJoin, LineStyle, LinkAnnotation, Node,
@@ -147,7 +147,7 @@ impl Exporter<'_> {
                 s.end_tagged();
                 let alt = alt.map(str::to_string).filter(|a| !a.is_empty()).or_else(|| Some("picture".to_string()));
                 let g = TagGroup::with_children(Tag::Figure(alt), vec![Node::Leaf(id)]);
-                self.tags.push(TagEntry { kind: Tag::Div.into(), children: vec![Node::Group(g)] });
+                self.tags.push(TagEntry { kind: Tag::Div.into(), children: vec![Node::Group(g)], list: None });
             }
         }
     }
@@ -329,14 +329,22 @@ impl Exporter<'_> {
         if let Some(i) = self.tag_index.get(&(story, path.clone())) {
             return *i;
         }
-        let kind: TagKind = match self.doc.para(story, path).map(|p| self.doc.styles.resolve_para(&p.props).outline_level) {
+        let resolved = self.doc.para(story, path).map(|p| self.doc.styles.resolve_para(&p.props));
+        let kind: TagKind = match resolved.as_ref().map(|r| r.outline_level) {
             Some(Some(l)) if l < 6 => {
                 let title = self.doc.para(story, path).map(|p| self.title_text(p, pl).trim().chars().take(200).collect::<String>());
                 Tag::Hn(NonZeroU16::new(u16::from(l) + 1).unwrap_or(NonZeroU16::MIN), title).into()
             }
             _ => Tag::P.into(),
         };
-        self.tags.push(TagEntry { kind, children: Vec::new() });
+        // A list paragraph (not a numbered heading) that shows a label is an item of its list.
+        let heading = matches!(resolved.as_ref().map(|r| r.outline_level), Some(Some(l)) if l < 6);
+        let list = resolved.and_then(|r| r.numbering).filter(|n| n.num != 0 && !heading && self.doc.numbering.shows_label(n.num, n.level)).map(|n| {
+            let level = self.doc.numbering.level(n.num, n.level.min(8));
+            let numbering = level.map_or(krilla::tagging::ListNumbering::Disc, |l| list_numbering(l.format, &l.text));
+            ListItem { num: n.num, level: n.level, numbering }
+        });
+        self.tags.push(TagEntry { kind, children: Vec::new(), list });
         let i = self.tags.len() - 1;
         self.tag_index.insert((story, path.clone()), i);
         i
@@ -344,11 +352,8 @@ impl Exporter<'_> {
 
     pub(crate) fn tag_tree(&mut self) -> TagTree {
         let mut tree = TagTree::new().with_lang(self.doc.styles.default_chr.lang.clone());
-        for e in std::mem::take(&mut self.tags) {
-            if e.children.is_empty() {
-                continue;
-            }
-            tree.push(TagGroup::with_children(e.kind, e.children));
+        for node in structure(std::mem::take(&mut self.tags)) {
+            tree.push(node);
         }
         tree
     }

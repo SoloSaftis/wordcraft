@@ -1,4 +1,6 @@
-use super::{ArtifactType, Draw, GraphicKind, Node, TagKind};
+use super::krilla::tagging::ListNumbering;
+use super::{ArtifactType, Draw, GraphicKind, Node, Tag, TagGroup, TagKind};
+use wordcraft_doc::section::NumFormat;
 
 /// A chart's or diagram's alt text: its own, else what it is ("chart", "diagram").
 pub(crate) fn graphic_alt(alt: &str, kind: GraphicKind) -> &str {
@@ -36,6 +38,97 @@ pub(crate) fn figure_alt(alt: &str, kind: Option<GraphicKind>) -> &str {
 pub(crate) struct TagEntry {
     pub(crate) kind: TagKind,
     pub(crate) children: Vec<Node>,
+    /// A list paragraph's list: its `num` id, level and how its labels look. Consecutive entries
+    /// of one list become one `L` with an `LI` each (see [`structure`]).
+    pub(crate) list: Option<ListItem>,
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct ListItem {
+    pub(crate) num: u32,
+    pub(crate) level: u8,
+    pub(crate) numbering: ListNumbering,
+}
+
+/// The list attribute for a level's label format (PDF 1.7 §14.8.5.5, `ListNumbering`).
+pub(crate) fn list_numbering(format: NumFormat, text: &str) -> ListNumbering {
+    match format {
+        NumFormat::Bullet => match text.trim() {
+            "\u{25CB}" | "o" => ListNumbering::Circle,
+            "\u{25A0}" | "\u{25AA}" | "\u{F0A7}" => ListNumbering::Square,
+            _ => ListNumbering::Disc,
+        },
+        NumFormat::None => ListNumbering::None,
+        NumFormat::UpperRoman => ListNumbering::UpperRoman,
+        NumFormat::LowerRoman => ListNumbering::LowerRoman,
+        NumFormat::UpperLetter => ListNumbering::UpperAlpha,
+        NumFormat::LowerLetter => ListNumbering::LowerAlpha,
+        _ => ListNumbering::Decimal,
+    }
+}
+
+/// One open list while [`structure`] nests list paragraphs: its level, label kind and the
+/// children of each of its items so far.
+struct OpenList {
+    level: u8,
+    numbering: ListNumbering,
+    items: Vec<Vec<Node>>,
+}
+
+fn close(list: OpenList) -> Node {
+    let items = list.items.into_iter().map(|children| Node::Group(TagGroup::with_children(Tag::LI, children))).collect();
+    Node::Group(TagGroup::with_children(Tag::L(list.numbering), items))
+}
+
+/// Closes every open list, each into the last item of the one around it, the outermost into `out`.
+fn finish(open: &mut Vec<OpenList>, out: &mut Vec<Node>) {
+    while let Some(list) = open.pop() {
+        let node = close(list);
+        match open.last_mut().and_then(|parent| parent.items.last_mut()) {
+            Some(item) => item.push(node),
+            None => out.push(node),
+        }
+    }
+}
+
+/// The structure tree's top-level elements for `entries` (in reading order): paragraphs as they
+/// are, empty ones left out, and each run of paragraphs of one list as an `L` whose items are
+/// `LI` > `LBody` (the label is drawn with the text, so there is no separate `Lbl`). A deeper
+/// level is a list inside the previous item; a level back up closes it.
+pub(crate) fn structure(entries: Vec<TagEntry>) -> Vec<Node> {
+    let mut out = Vec::new();
+    let mut open: Vec<OpenList> = Vec::new();
+    let mut current: Option<u32> = None;
+    for e in entries {
+        if e.children.is_empty() {
+            continue;
+        }
+        let Some(item) = e.list else {
+            finish(&mut open, &mut out);
+            current = None;
+            out.push(Node::Group(TagGroup::with_children(e.kind, e.children)));
+            continue;
+        };
+        if current != Some(item.num) {
+            finish(&mut open, &mut out);
+            current = Some(item.num);
+        }
+        while open.len() > 1 && open.last().is_some_and(|l| l.level > item.level) {
+            let inner = open.pop().map(close);
+            if let (Some(node), Some(parent)) = (inner, open.last_mut().and_then(|p| p.items.last_mut())) {
+                parent.push(node);
+            }
+        }
+        if open.last().is_none_or(|l| item.level > l.level && !l.items.is_empty()) {
+            open.push(OpenList { level: item.level, numbering: item.numbering, items: Vec::new() });
+        }
+        let body = Node::Group(TagGroup::with_children(Tag::LBody, e.children));
+        if let Some(list) = open.last_mut() {
+            list.items.push(vec![body]);
+        }
+    }
+    finish(&mut open, &mut out);
+    out
 }
 
 /// What the content being drawn is, for tagging.

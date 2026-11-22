@@ -260,7 +260,11 @@ pub(crate) fn precompose(
 /// A letter with harakat drawn as glyphs of their own («قً») keeps them in its text. pdftotext
 /// reads that span reversed («فريًقا»); Chrome-like viewers read it right. Text without harakat,
 /// as in most CVs and documents, is not affected.
-pub(crate) fn bare_marks(ranges: &[std::ops::Range<usize>], glyphs: &[(u32, f32, f32)], is_mark: impl Fn(u32) -> bool) -> Vec<std::ops::Range<usize>> {
+pub(crate) fn bare_marks(
+    ranges: &[std::ops::Range<usize>],
+    glyphs: &[(u32, f32, f32)],
+    is_mark: impl Fn(u32) -> bool,
+) -> Vec<std::ops::Range<usize>> {
     let mut out = ranges.to_vec();
     let mut i = 0;
     while i < ranges.len() {

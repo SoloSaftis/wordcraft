@@ -28,6 +28,37 @@ fn export_layout_inner(doc: &Document, lay: &DocLayout, opts: &PdfOptions) -> Re
     let mut adjusted = opts.clone();
     adjusted.tagged &= adjusted.sheet_copies <= 1;
     let opts = &adjusted;
+    let pages = selected_pages(lay, opts)?;
+    let ua = opts.pdf_ua && opts.tagged;
+    match write_all(doc, lay, opts, &pages, ua) {
+        Err(PdfError::NotPdfUa(problems)) if ua => {
+            log::info!("PDF: not written as PDF/UA-1 ({})", problems.join("; "));
+            write_all(doc, lay, opts, &pages, false)
+        }
+        result => result,
+    }
+}
+
+/// What keeps `doc` from being written as PDF/UA-1 by krilla's checks, one line each: empty when
+/// it passes, and then [`PdfOptions::pdf_ua`] writes it as PDF/UA-1. These are krilla's checks
+/// only (language, title, alt text, heading titles, outline, fonts, text mapping), not a full
+/// PDF/UA validator's.
+pub fn pdf_ua_problems(doc: &Document, opts: &PdfOptions) -> Result<Vec<String>, PdfError> {
+    let opts = PdfOptions { pdf_ua: true, tagged: true, sheet_copies: 1, ..opts.clone() };
+    write::guard(|| {
+        let lo = LayoutOptions { hide_deleted: !opts.include_markup, comment_balloons: opts.comments, numeral: opts.numeral, ..Default::default() };
+        let lay = layout(doc, &mut LayoutCache::new(), &lo);
+        let pages = selected_pages(&lay, &opts)?;
+        match write_all(doc, &lay, &opts, &pages, true) {
+            Ok(_) => Ok(Vec::new()),
+            Err(PdfError::NotPdfUa(problems)) => Ok(problems),
+            Err(error) => Err(error),
+        }
+    })
+}
+
+/// The layout pages to write, in order.
+fn selected_pages(lay: &DocLayout, opts: &PdfOptions) -> Result<Vec<usize>, PdfError> {
     let pages: Vec<usize> = match &opts.pages {
         Some(v) => {
             if let Some(bad) = v.iter().find(|p| **p >= lay.pages.len()) {
@@ -40,11 +71,16 @@ fn export_layout_inner(doc: &Document, lay: &DocLayout, opts: &PdfOptions) -> Re
     if pages.is_empty() {
         return Err(PdfError::NoPages);
     }
-    // krilla subsets fonts only when the document is finished, so one font it can't subset fails
-    // the whole export. Draw that font's glyphs as outlines instead and write the document again.
+    Ok(pages)
+}
+
+/// The PDF, as PDF/UA-1 when `ua`. krilla subsets fonts only when the document is finished, so
+/// one font it can't subset fails the whole export: that font's glyphs are drawn as outlines
+/// instead and the document written again.
+fn write_all(doc: &Document, lay: &DocLayout, opts: &PdfOptions, pages: &[usize], ua: bool) -> Result<Vec<u8>, PdfError> {
     let mut outlined = HashSet::new();
     loop {
-        match write_attempt(doc, lay, opts, &pages, &outlined)? {
+        match write_attempt(doc, lay, opts, pages, &outlined, ua)? {
             Attempt::Done(bytes) => return Ok(bytes),
             Attempt::BadFont(id, msg) if outlined.len() < MAX_OUTLINED_FONTS && outlined.insert(id) => {
                 log::warn!("PDF: {msg}; its text is drawn as outlines");
@@ -65,7 +101,14 @@ enum Attempt {
 }
 
 /// Serialize physical sheet sides while mapping link and outline destinations onto their cells.
-fn write_attempt(doc: &Document, lay: &DocLayout, opts: &PdfOptions, pages: &[usize], outlined: &HashSet<u32>) -> Result<Attempt, PdfError> {
+fn write_attempt(
+    doc: &Document,
+    lay: &DocLayout,
+    opts: &PdfOptions,
+    pages: &[usize],
+    outlined: &HashSet<u32>,
+    ua: bool,
+) -> Result<Attempt, PdfError> {
     let one_copy = opts.imposition.sheets(lay, pages, opts.paper)?;
     let copies = opts.sheet_copies.clamp(1, 999) as usize;
     if (opts.imposition != imposition::Imposition::Single || copies > 1) && one_copy.len().checked_mul(copies).is_none_or(|n| n > 5000) {
@@ -86,7 +129,12 @@ fn write_attempt(doc: &Document, lay: &DocLayout, opts: &PdfOptions, pages: &[us
             destinations.entry(slot.page).or_insert((output, Fit::in_slot(page, *slot)));
         }
     }
-    let settings = krilla::SerializeSettings { compress_content_streams: opts.compress, enable_tagging: opts.tagged, ..Default::default() };
+    let mut settings = krilla::SerializeSettings { compress_content_streams: opts.compress, enable_tagging: opts.tagged, ..Default::default() };
+    if ua {
+        use krilla::configure::{Accessibility, ConfigurationBuilder};
+        settings.configuration =
+            ConfigurationBuilder::new().with_accessibility_validator(Accessibility::UA1).finish().map_err(|e| PdfError::Write(format!("{e:?}")))?;
+    }
     let language = doc.styles.default_chr.lang.clone().filter(|l| !l.is_empty() && l.is_ascii());
     let mut writer = Writer::new_with_language(settings, metadata(doc, opts), language);
     let pdf = writer.document_mut();
@@ -155,6 +203,7 @@ fn write_attempt(doc: &Document, lay: &DocLayout, opts: &PdfOptions, pages: &[us
                     None => Err(PdfError::Write(format!("a font could not be embedded ({msg})"))),
                 }
             }
+            KrillaError::Validation(errors) => Err(PdfError::NotPdfUa(validation_problems(errors.into_iter().map(|(e, _)| e)))),
             error => Err(PdfError::Write(format!("{error:?}"))),
         },
         Err(error) => Err(error.into()),
@@ -235,4 +284,19 @@ mod tests {
             assert_eq!((fit.paper_w, fit.paper_h), (width, height));
         }
     }
+}
+
+/// krilla's validation errors as one line per kind ("MissingAltText ×3"), in first-seen order:
+/// the kinds, without the fonts and locations some of them carry.
+fn validation_problems(errors: impl IntoIterator<Item = krilla::configure::ValidationError>) -> Vec<String> {
+    let mut kinds: Vec<(String, usize)> = Vec::new();
+    for error in errors {
+        let debug = format!("{error:?}");
+        let kind = debug.split(['(', ' ', '{']).next().unwrap_or_default().to_string();
+        match kinds.iter_mut().find(|(k, _)| *k == kind) {
+            Some((_, n)) => *n += 1,
+            None => kinds.push((kind, 1)),
+        }
+    }
+    kinds.into_iter().map(|(k, n)| if n > 1 { format!("{k} ×{n}") } else { k }).collect()
 }

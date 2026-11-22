@@ -8,6 +8,9 @@ pub enum PdfError {
     BadPage(usize),
     #[error("PDF writing failed: {0}")]
     Write(String),
+    /// The file does not pass krilla's PDF/UA-1 checks: what failed, one line each.
+    #[error("not PDF/UA-1: {}", .0.join("; "))]
+    NotPdfUa(Vec<String>),
 }
 
 impl From<WriteError> for PdfError {
@@ -32,6 +35,11 @@ pub struct PdfOptions {
     pub author: Option<String>,
     /// Write a structure tree (tagged PDF, best effort).
     pub tagged: bool,
+    /// Aim for PDF/UA-1: check the tagged file against krilla's PDF/UA-1 rules and, when it
+    /// passes, write it as PDF/UA-1 (the identifier in its XMP metadata, the title shown in the
+    /// viewer's title bar). A file that does not pass is written as without this option;
+    /// [`crate::pdf_ua_problems`] tells why. Needs `tagged`.
+    pub pdf_ua: bool,
     /// Show tracked changes as markup (coloured, underlined / struck through).
     pub include_markup: bool,
     /// Print Markup's comments: each page is scaled down to make room on its right for the
@@ -63,6 +71,7 @@ impl Default for PdfOptions {
             title: None,
             author: None,
             tagged: true,
+            pdf_ua: false,
             include_markup: false,
             comments: false,
             compress: true,
